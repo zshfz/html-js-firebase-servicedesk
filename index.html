@@ -1,0 +1,649 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>카카오모빌리티 서비스데스크</title>
+    <link
+      rel="icon"
+      href="https://www.kakaomobility.com/favicon.ico"
+      type="image/x-icon"
+    />
+
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+      tailwind.config = {
+        theme: {
+          extend: {
+            colors: {
+              kmo: {
+                yellow: "#FEE500",
+                navy: "#1e2130",
+                gray: "#F2F4F6",
+                border: "#E2E2E2",
+              },
+            },
+            fontFamily: {
+              sans: ["Apple SD Gothic Neo", "Malgun Gothic", "sans-serif"],
+            },
+            boxShadow: { card: "0 4px 20px rgba(0, 0, 0, 0.03)" },
+          },
+        },
+      };
+    </script>
+
+    <script type="module">
+      import { initializeApp } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-app.js";
+      import {
+        getFirestore,
+        collection,
+        addDoc,
+        onSnapshot,
+        query,
+        where,
+        orderBy,
+        deleteDoc,
+        doc,
+        getDocs,
+      } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore.js";
+
+      // ⚠️ 여기에 본인의 Firebase 설정값을 붙여넣으세요!
+      const firebaseConfig = {
+        apiKey: "AIzaSyD4Bdqc7KGdN26yTltroWJ0V69fU6Rtqsg",
+        authDomain: "servicedesk-web-app.firebaseapp.com",
+        projectId: "servicedesk-web-app",
+        storageBucket: "servicedesk-web-app.firebasestorage.app",
+        messagingSenderId: "34500678403",
+        appId: "1:34500678403:web:c94a1734dde479076fcf36",
+      };
+
+      const app = initializeApp(firebaseConfig);
+      const db = getFirestore(app);
+
+      // 상태 관리 변수
+      let visitLogs = [];
+      let pendingLogs = [];
+      let qrQueue = [];
+      let currentProcessingVisitor = null;
+      let currentPage = 1;
+      const itemsPerPage = 5;
+
+      // 초기화
+      async function initProject() {
+        setupDateControls();
+        fetchQRQueue(); // 실시간 대기열 구독
+        fetchLogs(); // 완료 로그 구독
+      }
+
+      // --- [실시간] 대기열 데이터 가져오기 ---
+      function fetchQRQueue() {
+        const q = query(collection(db, "qrQueue"), orderBy("createdAt", "asc"));
+        onSnapshot(q, (snapshot) => {
+          qrQueue = snapshot.docs.map((doc) => ({ id: doc.id, ...doc.data() }));
+          renderQRQueue();
+          renderPendingLogs(); // 등록 버튼 상태 갱신을 위해 호출
+        });
+      }
+
+      // --- [실시간] 완료 로그 데이터 가져오기 ---
+      function fetchLogs() {
+        const q = query(
+          collection(db, "serviceDeskLogs"),
+          orderBy("time", "desc"),
+        );
+        onSnapshot(q, (snapshot) => {
+          visitLogs = snapshot.docs.map((doc) => ({
+            id: doc.id,
+            ...doc.data(),
+          }));
+          renderView(false);
+        });
+      }
+
+      // 대기열 렌더링
+      function renderQRQueue() {
+        const container = document.getElementById("qrQueueContainer");
+        const countEl = document.getElementById("queueCount");
+        container.innerHTML = "";
+        countEl.textContent = qrQueue.length;
+
+        if (qrQueue.length === 0) {
+          container.innerHTML = `<div class="col-span-full text-sm text-gray-400 py-6 text-center bg-gray-50 rounded-lg border-dashed border-2 border-gray-200">현재 대기 중인 QR 접수 내역이 없습니다.</div>`;
+          return;
+        }
+
+        qrQueue.forEach((visitor) => {
+          const isSelected =
+            currentProcessingVisitor &&
+            currentProcessingVisitor.id === visitor.id;
+          const card = document.createElement("div");
+          card.className = `p-4 rounded-xl border-2 cursor-pointer transition-all ${isSelected ? "border-kmo-yellow bg-yellow-50 shadow-md" : "border-white bg-white hover:border-gray-200 shadow-sm"}`;
+          card.onclick = () => {
+            currentProcessingVisitor = visitor;
+            document.getElementById("registrationTitle").innerHTML =
+              `상세 기록 입력 <span class="ml-2 text-xs font-normal bg-kmo-navy text-white px-2 py-0.5 rounded-full">${visitor.ldap}</span>`;
+            renderQRQueue();
+            renderPendingLogs();
+          };
+          card.innerHTML = `
+            <div class="flex justify-between items-start mb-2">
+              <div class="flex flex-col">
+                <span class="font-bold text-gray-900">${visitor.ldap || "미기재"}</span>
+                <span class="text-[10px] text-gray-400">${visitor.time}</span>
+              </div>
+              <button onclick="event.stopPropagation(); window.deleteQueueItem('${visitor.id}')" 
+                      class="text-gray-300 hover:text-red-500 p-1 transition">
+                ✕
+              </button>
+            </div>
+            <div class="text-xs text-gray-500 truncate">${visitor.purpose}</div>
+          `;
+          container.appendChild(card);
+        });
+      }
+
+      // --- 수동 대기열 등록 로직 ---
+      window.openManualModal = () => {
+        document.getElementById("manualModal").classList.remove("hidden");
+        document.getElementById("manualLdap").focus(); // 모달 열리면 바로 타이핑 가능하게
+      };
+
+      window.closeManualModal = () => {
+        document.getElementById("manualModal").classList.add("hidden");
+        document.getElementById("manualLdap").value = "";
+        document.getElementById("manualPurpose").value = "";
+      };
+
+      window.submitManualQueue = async () => {
+        const ldap = document.getElementById("manualLdap").value.trim();
+        const purpose = document.getElementById("manualPurpose").value.trim();
+
+        if (!ldap) {
+          alert("LDAP ID를 입력해주세요!");
+          return;
+        }
+
+        try {
+          const now = new Date();
+          const timeString = now.toLocaleTimeString("ko-KR", {
+            hour: "2-digit",
+            minute: "2-digit",
+            second: "2-digit",
+          });
+
+          // Firestore qrQueue에 직접 쏘기
+          await addDoc(collection(db, "qrQueue"), {
+            ldap: ldap,
+            purpose: purpose || "수동 접수", // 목적 비워두면 기본값
+            time: timeString,
+            date: getKSTToday(),
+            company: "Kakaomobility",
+            status: "waiting",
+            createdAt: now,
+          });
+
+          closeManualModal(); // 성공 시 팝업 닫고 초기화
+        } catch (e) {
+          console.error("수동 등록 실패:", e);
+          alert("등록 중 오류가 발생했습니다.");
+        }
+      };
+
+      // [추가] 대기열 아이템 삭제 함수
+      window.deleteQueueItem = async (id) => {
+        if (confirm("대기열에서 삭제하시겠습니까?")) {
+          try {
+            await deleteDoc(doc(db, "qrQueue", id));
+            // 만약 지금 선택해서 상세 입력 중인 대상이었다면 선택 해제
+            if (
+              currentProcessingVisitor &&
+              currentProcessingVisitor.id === id
+            ) {
+              currentProcessingVisitor = null;
+              pendingLogs = [];
+              document.getElementById("registrationTitle").textContent =
+                "방문 기록 상세 입력";
+              renderPendingLogs();
+            }
+            alert("삭제되었습니다.");
+          } catch (e) {
+            console.error("삭제 실패:", e);
+            alert("삭제 중 오류가 발생했습니다.");
+          }
+        }
+      };
+
+      // 등록 로직
+      window.addPendingLog = () => {
+        const asset = document.getElementById("assetSelect").value;
+        const action = document.getElementById("actionSelect").value;
+        pendingLogs.push({ asset, action });
+        renderPendingLogs();
+      };
+
+      window.removePendingLog = (index) => {
+        pendingLogs.splice(index, 1);
+        renderPendingLogs();
+      };
+
+      function renderPendingLogs() {
+        const listEl = document.getElementById("pendingLogList");
+        const btn = document.getElementById("submitLogBtn");
+        listEl.innerHTML = "";
+
+        if (pendingLogs.length === 0) {
+          listEl.innerHTML = `<li class="text-gray-400 text-sm py-4 text-center bg-gray-50 rounded-lg italic">항목을 추가해주세요.</li>`;
+        }
+
+        pendingLogs.forEach((log, i) => {
+          const li = document.createElement("li");
+          li.className =
+            "flex justify-between items-center p-3 bg-white border border-gray-100 rounded-lg text-sm mb-2 shadow-sm";
+          li.innerHTML = `<span><b>${log.asset}</b> | ${log.action}</span><button onclick="removePendingLog(${i})" class="text-gray-300 hover:text-red-500">✕</button>`;
+          listEl.appendChild(li);
+        });
+
+        const canSubmit =
+          pendingLogs.length > 0 && currentProcessingVisitor !== null;
+        btn.disabled = !canSubmit;
+        btn.className = `w-full font-bold py-4 rounded-xl transition flex justify-center items-center gap-2 ${canSubmit ? "bg-kmo-yellow text-kmo-navy shadow-lg" : "bg-gray-200 text-gray-400 cursor-not-allowed"}`;
+        btn.innerHTML = canSubmit
+          ? `<span>${currentProcessingVisitor.ldap}님 기록 등록</span>`
+          : `<span>대상을 선택하고 항목을 추가하세요</span>`;
+      }
+
+      window.submitLog = async () => {
+        if (!currentProcessingVisitor) return;
+        const selectedDate = document.getElementById("recordDate").value;
+        const newLog = {
+          date: selectedDate,
+          time: new Date().toLocaleTimeString("ko-KR", {
+            hour: "2-digit",
+            minute: "2-digit",
+            second: "2-digit",
+          }),
+          ldap: currentProcessingVisitor.ldap,
+          items: pendingLogs,
+          // 👇 이 줄을 추가하세요! (나중에 삭제/복구 시 원래 방문 목적을 잃어버리지 않기 위해)
+          originalPurpose: currentProcessingVisitor.purpose || "",
+        };
+
+        try {
+          await addDoc(collection(db, "serviceDeskLogs"), newLog); // 완료 로그 저장
+          await deleteDoc(doc(db, "qrQueue", currentProcessingVisitor.id)); // 대기열에서 삭제
+
+          pendingLogs = [];
+          currentProcessingVisitor = null;
+          document.getElementById("registrationTitle").textContent =
+            "방문 기록 상세 입력";
+          renderPendingLogs();
+          alert("등록되었습니다!");
+        } catch (e) {
+          console.error(e);
+        }
+      };
+
+      window.deleteLog = async (id) => {
+        // 1. 현재 화면에 있는 로그 목록(visitLogs)에서 삭제하려는 대상을 찾습니다.
+        const targetLog = visitLogs.find((log) => log.id === id);
+        if (!targetLog) return;
+
+        if (
+          confirm(
+            "이 처리 내역을 삭제하고 대상자를 대기열로 돌려보내시겠습니까? (수정용)",
+          )
+        ) {
+          try {
+            // 2. 대기열(qrQueue) 컬렉션에 다시 문서를 생성합니다.
+            await addDoc(collection(db, "qrQueue"), {
+              ldap: targetLog.ldap,
+              time: targetLog.time,
+              purpose: targetLog.originalPurpose || "기록 수정 (재접수)", // 복구된 건임을 알 수 있게
+              createdAt: new Date(), // 현재 시간 기준으로 대기열 맨 끝에 추가
+            });
+
+            // 3. 원래 있던 처리 내역(serviceDeskLogs)에서는 삭제합니다.
+            await deleteDoc(doc(db, "serviceDeskLogs", id));
+
+            alert("대기열로 복구되었습니다! 다시 상세 내용을 입력해 주세요.");
+          } catch (e) {
+            console.error("복구 실패:", e);
+            alert("대기열 복구 중 오류가 발생했습니다.");
+          }
+        }
+      };
+
+      // --- 기존 렌더링 로직 (유지 및 수정) ---
+      function getKSTToday() {
+        return new Date(new Date().getTime() + 9 * 60 * 60 * 1000)
+          .toISOString()
+          .split("T")[0];
+      }
+      function getFilterDate() {
+        return document.getElementById("filterDate").value;
+      }
+
+      function setupDateControls() {
+        const today = getKSTToday();
+        document.getElementById("filterDate").value = today;
+
+        // 👇 새로 만든 날짜 입력창들도 오늘 날짜로 초기화
+        if (document.getElementById("recordDate"))
+          document.getElementById("recordDate").value = today;
+        if (document.getElementById("manualDate"))
+          document.getElementById("manualDate").value = today;
+
+        document.getElementById("filterDate").onchange = () => renderView(true);
+      }
+
+      window.changePage = (p) => {
+        currentPage = p;
+        renderView(false);
+      };
+
+      window.renderView = (reset = true) => {
+        if (reset) currentPage = 1;
+        const filterDate = getFilterDate();
+        const filtered = visitLogs.filter((l) => l.date === filterDate);
+        const aggregated = aggregateData(filtered);
+
+        document.getElementById("currentDateDisplay").innerHTML =
+          `<span class="text-2xl font-bold">${filterDate}</span>`;
+        document.getElementById("summaryText").innerHTML =
+          `<b>${filtered.length}</b>명 방문 / <b>${aggregated.totalItemCount}</b>개 처리`;
+
+        const start = (currentPage - 1) * itemsPerPage;
+        const paged = filtered.slice(start, start + itemsPerPage);
+
+        renderTable(paged);
+        renderPagination(filtered.length);
+        renderTop3List(aggregated.top3);
+      };
+
+      function renderTable(logs) {
+        const body = document.getElementById("logTableBody");
+        body.innerHTML =
+          logs.length === 0
+            ? `<tr><td colspan="3" class="text-center py-10 text-gray-400">내역이 없습니다.</td></tr>`
+            : "";
+        logs.forEach((log) => {
+          const row = body.insertRow();
+          row.className =
+            "hover:bg-gray-50 border-b border-gray-50 last:border-0";
+          row.innerHTML = `
+            <td class="px-6 py-4 font-bold text-gray-700">${log.ldap || "알수없음"}</td>
+            <td class="px-6 py-4">${log.items.map((i) => `<span class="inline-block bg-gray-100 px-2 py-1 rounded text-xs mr-1 mb-1">${i.asset}|${i.action}</span>`).join("")}</td>
+            <td class="px-6 py-4 text-center"><button onclick="deleteLog('${log.id}')" class="text-gray-300 hover:text-red-500">✕</button></td>
+          `;
+        });
+      }
+
+      function renderPagination(total) {
+        const el = document.getElementById("paginationControls");
+        el.innerHTML = "";
+        const pages = Math.ceil(total / itemsPerPage);
+        for (let i = 1; i <= pages; i++) {
+          const btn = document.createElement("button");
+          btn.className = `w-7 h-7 rounded-full text-xs mx-1 ${i === currentPage ? "bg-kmo-yellow font-bold" : "bg-white border text-gray-400"}`;
+          btn.textContent = i;
+          btn.onclick = () => changePage(i);
+          el.appendChild(btn);
+        }
+      }
+
+      function aggregateData(logs) {
+        let counts = {},
+          total = 0;
+        logs.forEach((l) =>
+          l.items.forEach((i) => {
+            let k = `${i.asset}(${i.action})`;
+            counts[k] = (counts[k] || 0) + 1;
+            total++;
+          }),
+        );
+        const top3 = Object.entries(counts)
+          .sort((a, b) => b[1] - a[1])
+          .slice(0, 3)
+          .map(([name, count]) => ({ name, count }));
+        return { totalItemCount: total, top3 };
+      }
+
+      function renderTop3List(top3) {
+        const el = document.getElementById("top3List");
+        el.innerHTML =
+          top3.length === 0
+            ? `<li class="text-gray-400 text-xs">데이터 없음</li>`
+            : "";
+        top3.forEach((item, i) => {
+          el.innerHTML += `<li class="flex justify-between py-2 border-b border-gray-50 text-sm"><span><b class="text-kmo-yellow mr-2">${i + 1}</b>${item.name}</span><span class="font-bold">${item.count}</span></li>`;
+        });
+      }
+
+      window.addEventListener("DOMContentLoaded", initProject);
+    </script>
+  </head>
+
+  <body class="bg-kmo-gray min-h-screen font-sans text-gray-800">
+    <header
+      class="bg-kmo-navy h-16 flex items-center px-6 sticky top-0 z-50 shadow-md"
+    >
+      <div class="max-w-6xl mx-auto w-full flex items-center justify-between">
+        <div class="flex items-center gap-3">
+          <span class="font-extrabold text-kmo-yellow text-lg">kakao</span
+          ><span class="text-white text-lg font-light">mobility</span>
+          <div class="h-4 w-px bg-gray-600 mx-1"></div>
+          <span class="text-sm font-semibold text-white">IT Service Desk</span>
+        </div>
+
+        <div class="text-xs text-gray-400 font-medium tracking-wide">
+          made by <span class="text-kmo-yellow font-bold">jm.zshfz</span>
+        </div>
+      </div>
+    </header>
+
+    <div class="max-w-6xl mx-auto px-6 py-8">
+      <div class="grid grid-cols-1 lg:grid-cols-12 gap-8">
+        <div class="lg:col-span-8 space-y-6">
+          <div
+            class="bg-white rounded-2xl shadow-card p-6 border border-kmo-border"
+          >
+            <div class="flex justify-between items-center mb-4">
+              <h2
+                class="text-lg font-bold text-kmo-navy flex items-center gap-2"
+              >
+                QR 접수 대기열
+                <span
+                  id="queueCount"
+                  class="bg-red-500 text-white text-xs px-2 py-0.5 rounded-full"
+                  >0</span
+                >
+              </h2>
+              <button
+                onclick="openManualModal()"
+                class="text-xs bg-gray-100 hover:bg-gray-200 text-gray-600 px-3 py-1.5 rounded-lg font-bold transition"
+              >
+                + 수동 접수
+              </button>
+            </div>
+            <div
+              id="qrQueueContainer"
+              class="grid grid-cols-1 sm:grid-cols-3 gap-3"
+            ></div>
+          </div>
+
+          <div
+            class="bg-white rounded-2xl shadow-card p-6 border border-kmo-border"
+          >
+            <h2
+              id="registrationTitle"
+              class="text-lg font-bold text-kmo-navy mb-6"
+            >
+              방문 기록 상세 입력
+            </h2>
+            <div class="mb-4">
+              <label class="block text-xs font-bold text-gray-500 mb-1"
+                >기록 날짜 선택</label
+              >
+              <input
+                type="date"
+                id="recordDate"
+                class="w-full border rounded-xl px-4 py-2 text-sm focus:ring-2 focus:ring-kmo-yellow outline-none"
+              />
+            </div>
+            <div class="flex gap-3 mb-4">
+              <select
+                id="assetSelect"
+                class="flex-1 border rounded-xl px-4 py-3 text-sm focus:ring-2 focus:ring-kmo-yellow outline-none"
+              >
+                <option value="노트북">노트북</option>
+                <option value="모바일기기">모바일기기</option>
+                <option value="PC">PC</option>
+                <option value="모니터">모니터</option>
+                <option value="전산소모품">전산소모품</option>
+                <option value="유심">유심</option>
+                <option value="카트">카트</option>
+                <option value="쇼핑백">쇼핑백</option>
+                <option value="가습기">가습기</option>
+                <option value="캐노피">캐노피</option>
+                <option value="상비약">상비약</option>
+                <option value="Okta">Okta</option>
+                <option value="와이파이">와이파이</option>
+                <option value="프린트">프린트</option>
+                <option value="기타 SW">기타 SW</option>
+                <option value="단순 문의">단순 문의</option>
+                <option value="퇴사">퇴사</option>
+                <option value="휴직">휴직</option>
+                <option value="노트북 PW">노트북 PW</option>
+                <option value="불명">불명</option>
+              </select>
+              <select
+                id="actionSelect"
+                class="flex-1 border rounded-xl px-4 py-3 text-sm focus:ring-2 focus:ring-kmo-yellow outline-none"
+              >
+                <option value="수령">수령</option>
+                <option value="반납">반납</option>
+                <option value="대여">대여</option>
+                <option value="교체">교체</option>
+                <option value="트러블슈팅">트러블슈팅</option>
+                <option value="단순 문의">단순 문의</option>
+                <option value="로이가 처리">로이가 처리</option>
+              </select>
+              <button
+                onclick="addPendingLog()"
+                class="bg-kmo-navy text-white px-6 rounded-xl font-bold"
+              >
+                +
+              </button>
+            </div>
+            <ul id="pendingLogList" class="mb-6"></ul>
+            <button
+              id="submitLogBtn"
+              onclick="submitLog()"
+              disabled
+              class="w-full py-4 rounded-xl font-bold bg-gray-200 text-gray-400"
+            >
+              대상을 선택하세요
+            </button>
+          </div>
+
+          <div
+            class="bg-white rounded-2xl shadow-card overflow-hidden border border-kmo-border"
+          >
+            <div
+              class="px-6 py-4 border-b flex justify-between items-center bg-gray-50/50"
+            >
+              <h2 class="font-bold">처리 내역</h2>
+              <input
+                type="date"
+                id="filterDate"
+                class="bg-transparent text-sm outline-none cursor-pointer"
+              />
+            </div>
+            <table class="w-full">
+              <thead
+                class="bg-white text-left text-xs font-bold text-gray-400 border-b"
+              >
+                <tr>
+                  <th class="px-6 py-3 w-[20%]">대상자</th>
+                  <th class="px-6 py-3 w-[65%]">내역</th>
+                  <th class="px-6 py-3 text-center w-[15%]">관리</th>
+                </tr>
+              </thead>
+              <tbody id="logTableBody"></tbody>
+            </table>
+            <div
+              id="paginationControls"
+              class="p-4 flex justify-center border-t"
+            ></div>
+          </div>
+        </div>
+
+        <div class="lg:col-span-4">
+          <div
+            class="bg-white rounded-2xl shadow-card p-6 sticky top-24 border border-kmo-border"
+          >
+            <div
+              id="currentDateDisplay"
+              class="text-sm text-gray-400 mb-1"
+            ></div>
+            <div id="summaryText" class="text-lg mb-6 text-gray-400">-</div>
+            <div class="border-t pt-6">
+              <h3 class="text-sm font-bold mb-4">🏆 가장 많이 처리한 업무</h3>
+              <ul id="top3List" class="space-y-1"></ul>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div
+      id="manualModal"
+      class="hidden fixed inset-0 bg-black/50 z-[100] flex items-center justify-center backdrop-blur-sm"
+    >
+      <div class="bg-white rounded-2xl w-full max-w-sm p-6 shadow-2xl">
+        <div class="flex justify-between items-center mb-5">
+          <h3 class="font-bold text-lg">수동 대기열 등록</h3>
+          <button
+            onclick="closeManualModal()"
+            class="text-gray-400 hover:text-red-500 font-bold"
+          >
+            ✕
+          </button>
+        </div>
+
+        <div class="space-y-4">
+          <div>
+            <label class="block text-xs font-bold text-gray-500 mb-1"
+              >LDAP ID <span class="text-red-500">*</span></label
+            >
+            <input
+              type="text"
+              id="manualLdap"
+              placeholder="예: ryan.lion"
+              class="w-full border rounded-xl px-4 py-2 text-sm focus:ring-2 focus:ring-kmo-yellow outline-none"
+              autocomplete="off"
+            />
+          </div>
+          <div>
+            <label class="block text-xs font-bold text-gray-500 mb-1"
+              >방문 목적</label
+            >
+            <input
+              type="text"
+              id="manualPurpose"
+              placeholder="예: 마우스 수령"
+              class="w-full border rounded-xl px-4 py-2 text-sm focus:ring-2 focus:ring-kmo-yellow outline-none"
+              autocomplete="off"
+            />
+          </div>
+        </div>
+
+        <button
+          onclick="submitManualQueue()"
+          class="w-full bg-kmo-navy text-white font-bold py-3 rounded-xl mt-6 hover:bg-gray-800 transition"
+        >
+          대기열에 추가
+        </button>
+      </div>
+    </div>
+  </body>
+</html>
